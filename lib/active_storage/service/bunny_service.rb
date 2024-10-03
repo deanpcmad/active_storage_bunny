@@ -1,26 +1,32 @@
 # frozen_string_literal: true
 
 require 'active_support/core_ext/numeric/bytes'
-require 'bunny_storage_client'
+require 'bunnyrb'
 
 module ActiveStorage
   # Wraps the BunnyCDN Storage as an Active Storage service.
   # See ActiveStorage::Service for the generic API documentation that applies to all services.
   class Service::BunnyService < Service
 
-    CDN_BASE_URL = "https://#{ENV['BUNNY_STORAGE_ZONE']}.b-cdn.net"
-
     attr_reader :client
 
-    def initialize(access_key:, api_key:, storage_zone:, **options)
-      @client = BunnyStorageClient.new(access_key, api_key, storage_zone)
+    def initialize(edge_name:, edge_region:, edge_api_token:, cdn_zone:, **options)
+      @edge_name = edge_name
+      @cdn_zone = cdn_zone
+
+      Bunny.configure do |config|
+        config.edge_name = edge_name
+        config.edge_region = edge_region
+        config.edge_api_token = edge_api_token
+      end
+
       super(**options)
     end
 
-    def upload(key, io, checksum: nil, filename: nil, content_type: nil, disposition: nil, custom_metadata: {}, **)
+    def upload(key, io, checksum: nil, filename: nil, content_type: nil, disposition: nil, **)
       instrument :upload, key: key, checksum: checksum do
         content_disposition = content_disposition_with(filename: filename, type: disposition) if disposition && filename
-        upload_with_single_part key, io, checksum: checksum, content_type: content_type, content_disposition: content_disposition, custom_metadata: custom_metadata
+        upload_with_single_part key, io, checksum: checksum, content_type: content_type, content_disposition: content_disposition
       end
     end
 
@@ -34,13 +40,17 @@ module ActiveStorage
 
     def delete(key)
       instrument :delete, key: key do
-        object_for(key).delete_file
+        Bunny::Edge::Upload.delete(name: key)
       end
     end
 
     def delete_prefixed(prefix)
       instrument :delete_prefixed, prefix: prefix do
-        # BunnyStorageClient does not natively support this operation yet.
+        begin
+          Bunny::Edge::Upload.delete(path: prefix)
+        rescue
+          # do nothing
+        end
       end
     end
 
@@ -52,24 +62,6 @@ module ActiveStorage
       end
     end
 
-    def url_for_direct_upload(key, expires_in:, content_type:, content_length:, checksum:, custom_metadata: {})
-      instrument :url, key: key do |payload|
-        generated_url = object_for(key).presigned_url :put, expires_in: expires_in.to_i,
-                                                            content_type: content_type, content_length: content_length, content_md5: checksum,
-                                                            metadata: custom_metadata, whitelist_headers: ['content-length'], **upload_options
-
-        payload[:url] = generated_url
-
-        generated_url
-      end
-    end
-
-    def headers_for_direct_upload(key, content_type:, checksum:, filename: nil, disposition: nil, custom_metadata: {}, **)
-      content_disposition = content_disposition_with(type: disposition, filename: filename) if filename
-
-      { 'Content-Type' => content_type, 'Content-MD5' => checksum, 'Content-Disposition' => content_disposition, **custom_metadata_headers(custom_metadata) }
-    end
-
     private
 
     def private_url(key, expires_in:, filename:, disposition:, content_type:, **)
@@ -78,12 +70,11 @@ module ActiveStorage
     end
 
     def public_url(key)
-      File.join(CDN_BASE_URL, key)
+      File.join("https://#{@cdn_zone}.b-cdn.net", key)
     end
 
     def upload_with_single_part(key, io, checksum: nil, content_type: nil, content_disposition: nil, custom_metadata: {})
-      object_for(key).upload_file(body: io)
-      object_for(key).purge_cache
+      Bunny::Edge::Upload.create(name: key, file: io)
     rescue StandardError
       raise ActiveStorage::IntegrityError
     end
@@ -92,8 +83,8 @@ module ActiveStorage
       # BunnyStorageClient does not natively support this operation yet.
     end
 
-    def object_for(key)
-      client.object(key)
-    end
+    # def object_for(key)
+    #   client.object(key)
+    # end
   end
 end
